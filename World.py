@@ -194,6 +194,7 @@ class World(object):
             dis_forward: 推进距离
             SINR: 信噪比
         """
+               
         if dis_forward < 0:
             forward = -2
         else:
