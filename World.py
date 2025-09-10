@@ -38,17 +38,18 @@ class World(object):
         self.terminal = False
         self.total_engy = 0.0
         self.out_time = 0.0
-        self.NON_COVER_PENALTY = - 30
-        self.Engy_w = 0.15
+        self.NON_COVER_PENALTY = - 10
+        self.Engy_w = 0.05
 
         self.initial_loc = ini_loc # 起点
         self.end_loc = end_loc # 终点
         self.distance = 0.5 # m
-        self.SIR_THRESHOLD =1 # dB
+        self.SIR_THRESHOLD =3 # dB
         self.data_size_ini = data_size # 每个巡检点的数据量
         self.data_size = self.data_size_ini  # 每个巡检点的数据量
         self.data_rate = 0
         self.BandWidth  = 1
+        self.transmit = False # 是否完成数据传输
         
         self.Traverse = traverse_sequence # 巡检点序列
         self.Traverse_order = 0 # 巡检点序列索引
@@ -60,7 +61,7 @@ class World(object):
         self.target = self.Users[self.Traverse[self.Traverse_order]-1]
         self.target_loc = np.array([self.target.x, self.target.y])  # 目标位置
         self.target_dis = LA.norm(self.initial_loc - self.target_loc) # 距离目标的距离
-        self.target_pre_loc = np.array([self.initial_loc[0],self.initial_loc[0]]) #上一个目标的位置，初始为起点
+        self.target_pre_loc = np.array([self.initial_loc[0],self.initial_loc[1]]) #上一个目标的位置，初始为起点
         
         
         self.urban_world = Rural_world(self.GT_loc)
@@ -100,6 +101,7 @@ class World(object):
         self.set_uavs_loc()
         state = self.reset_state()
         self.data_size = self.data_size_ini
+        self.transmit = False   
         self.t = 0
         self.fa = 0
         self.out_time = 0
@@ -154,21 +156,22 @@ class World(object):
     # 重置环境
     
     def reset_state(self):
-        s = np.zeros(self.uav_num*2 + 2+1+1)
-        
+        s = np.zeros(self.uav_num*2 + 2+1+1+1+1)  
         # UAV location
         for i,uav in enumerate(self.UAVs):
-            s[2*i] = uav.x
+            s[2*i] = uav.x                      
             s[2*i+1] = uav.y
         s[2] = self.target_loc[0]
         s[3] = self.target_loc[1]
         s[4] = self.target_dis
+        s[5] = self.data_size
+        s[6] = 1.0 if self.transmit else 0.0
         
         s[-1] = 0.0
         return s
 
     def update_state(self, engy,tar_loc,tar_dis):
-        s_ = np.zeros(self.uav_num * 2 +2 +1 + 1 ) # 下一状态
+        s_ = np.zeros(self.uav_num * 2 +2 +1 + 1+1+1) # 下一状态
         for i,uav in enumerate(self.UAVs):
             s_[i*2] = uav.x
             s_[i*2+1] = uav.y
@@ -176,13 +179,32 @@ class World(object):
         s_[2] = tar_loc[0]
         s_[3] = tar_loc[1]
         s_[4] = tar_dis
+        s_[5] = self.data_size
+        s_[6] = 1.0 if self.transmit else 0.0
         s_[-1] = engy
         return s_
 
     # 奖励表达式 平滑处理
-    def get_reward(self,fa,s,dis_target,dis_pre_target):
-        # reward =  - self.Engy_w * s[-1] - fa + 20* dis_end
-        reward = - self.Engy_w * s[-1] -0.1*fa + 0.5*dis_pre_target -dis_target
+    def get_reward(self,fa,fly_engy,dis_target,dis_pre_target,dis_forward,SINR):
+        """
+            fa: 出界惩罚
+            fly_engy: 飞行能量
+            dis_target: 当前位置与目标点距离
+            dis_pre_target: 当前位置与上一个目标点距离
+            dis_forward: 推进距离
+            SINR: 信噪比
+        """
+        if dis_forward < 0:
+            forward = -2
+        else:
+            forward = 1
+       
+        reward = forward*abs(dis_forward)*100 + 0.8*dis_pre_target - dis_target - fa
+        # print("推进奖惩：",dis_forward*100,"距离目标奖励：",0.8*dis_pre_target - dis_target,"能量惩罚：",- self.Engy_w * fly_engy,"出界惩罚：",-fa)
+        if SINR < self.SIR_THRESHOLD:
+            # print("信噪比惩罚",self.NON_COVER_PENALTY)
+            reward += self.NON_COVER_PENALTY
+      
         return reward
 
     def get_empirical_outage(self, location,):
@@ -205,8 +227,9 @@ class World(object):
     def step_inside(self, actions,s,t): # 输入动作，状态值，时间步,输出下一状态和其他标志
         fa = 0.0
         reward = 0.0
+        fly_energy = 0.0
         self.t = t+1 # 时间步+1
-        state_ = np.zeros(self.uav_num*2 + 1)
+        state_ = np.zeros(self.uav_num*2 +2+4)
         uav_location_pre = np.zeros([self.uav_num, 2])  # make a copy of the uav's location
         uav_location = np.zeros([self.uav_num, 2]) # uav current location
         for i, uav in enumerate(self.UAVs):
@@ -237,38 +260,40 @@ class World(object):
         # 判断信噪比大小，避免出现负数
         
         if(MaxSINR >= self.SIR_THRESHOLD ):
-                self.data_rate = self.BandWidth * np.log2(1 + MaxSINR)  # 数据传输速率
-                if(self.data_size >= 20):
-                    reward += 10
-                    self.data_size -= self.data_rate*self.delta_T # 数据量减少
-                else:
-                    reward += 100
+            self.data_rate = self.BandWidth * np.log2(1 + 10**(MaxSINR/10.0))  # 数据传输速率
+            if not self.transmit:
+                self.data_size -= self.data_rate*self.delta_T
+                reward += (self.data_rate*self.delta_T)
+                if(self.data_size < 20):
+                    self.transmit = True
+                    print("=================================data transmit complete!!========================")
+                    reward += 200
                     self.data_size = 0
-        else:
-                reward -= 2
-                self.data_size = self.data_size
-                self.data_rate = 0
-        
-        
+      
         step_cur = LA.norm(uav_location - self.target_loc)  # 此位置与目标点距离
         self.target_dis = step_cur #更新目标距离
         
         step_pre = LA.norm(uav_location_pre - self.target_loc)  # 前一位置与目标点距离
-        step_cur_pre = LA.norm(uav_location - self.target_pre_loc) # 此位置与前一目标点距离
-        # print("目标点:",self.Traverse_order,"当前距离:",step_cur)
-           
+        step_cur_pre = LA.norm(uav_location - self.target_pre_loc) # 此位置与前一目标点距离         
         reduce_dis = step_pre - step_cur #推进距离
         
-        # reward = self.get_reward(fa,state_,reduce_dis) # 进入下一状态后获得的奖励
-        reward = self.get_reward(fa,state_,step_cur,step_cur_pre)
-        reward += np.clip(reduce_dis, -1, 1)*5 #如果没有推进就会惩罚
-        # reward -= 0.1*step_cur
+        reward += self.get_reward(fa,fly_energy,step_cur,step_cur_pre,reduce_dis,MaxSINR) 
+         
         
-        if step_cur<=self.distance and self.data_size<=10: # 是否到达目标点and 数据计算完成
-        # if step_cur<=self.distance :
-            reward += 1000             
+        if step_cur<=self.distance : # 达到检查点
+            #只要到目标点了，就换下一个目标点，根据传输完成情况进行奖惩
+            if self.transmit:  
+                print("arrive and transmit complete")
+                reward += 1000      
+            else:
+                print("arrive but not transmit complete, data size:",self.data_size)
+                reward -= self.data_size*2   
+                     
+                
             self.target_pre_loc = self.target_loc #更新上一个目标点的位置        
-                            
+            self.transmit = False
+            self.data_size += self.data_size_ini # 重置数据量  
+            
             if self.Traverse_order == len(self.Traverse): #到达终点了
                 self.terminal = True
                 self.done = True    
@@ -285,28 +310,12 @@ class World(object):
                     print("=================================arrive point:",self.Traverse[self.Traverse_order])
                     self.Traverse_order += 1 #更新目标点
                     self.target_loc = self.end_loc
-                
-        # if step_cur <= self.distance:
-        #     reward += 1000
-        #     print("====== Arrived point:", self.Traverse[self.Traverse_order])
-
-        #     self.Traverse_order += 1  # 无论如何，索引先加1
-
-        #     if self.Traverse_order >= len(self.Traverse):  # 到达所有目标点
-        #         self.terminal = True
-        #         self.done = True
-        #         self.target_loc = self.end_loc
-        #     else:
-        #         self.terminal = False
-        #         self.done = False
-        #         self.target = self.Users[self.Traverse[self.Traverse_order] - 1]
-        #         self.target_loc = np.array([self.target.x, self.target.y])
-                
+            # else :
+                # reward -= 10 # 到达巡检点但数据未传输完成，给予惩罚
+                # print("=================================arrive point but not transmit complete, data size:",self.data_size)            
         else:
-            
-            # reward -= 10 #dis_only
-            reward -= 1 #dis && engy
             self.terminal = False
+            
         done = False
 
         if self.terminal or self.t >= self.T: # 如果任务完成，或者飞行时间步已经满了
