@@ -104,23 +104,23 @@ class World(object):
     def reset(self):
         self.reset_target()
         self.set_uavs_loc()
-        state = self.reset_state()
-        self.data_size = self.data_size_ini
-        self.transmit = False   
+        self.data_size = 0
+        self.transmit = True  
         self.t = 0
         self.fa = 0
         self.out_time = 0
         self.total_engy = 0.0
+        state = self.reset_state()
         return state,self.t
 
-    def reset_loc(self):
-        self.set_uavs_loc()
-        state = self.reset_state()
-        self.t = 0
-        self.fa = 0
-        self.out_time = 0
-        self.total_engy = 0.0
-        return state,self.t
+    # def reset_loc(self):
+    #     self.set_uavs_loc()
+    #     state = self.reset_state()
+    #     self.t = 0
+    #     self.fa = 0
+    #     self.out_time = 0
+    #     self.total_engy = 0.0
+    #     return state,self.t
 
     def set_uavs_loc(self):
         self.UAVs = []
@@ -131,25 +131,30 @@ class World(object):
             self.UAVs.append(UAV(x, y, h))
     
     def reset_state(self):
-        s = np.zeros(self.uav_num*2 + 2+1)  
+        State_dim = self.uav_num*2+2+1
+        s = np.zeros(State_dim)  
         # UAV location
         for i,uav in enumerate(self.UAVs):
             s[2*i] = uav.x                      
             s[2*i+1] = uav.y
         s[2] = self.target_loc[0]
         s[3] = self.target_loc[1]
-        s[4] = self.target_dis
-        
+        # s[4] = self.target_dis
+        s[4] = self.data_size
+        # s[5] = self.T-self.t #剩余可用时间步
         return s
 
     def update_state(self, engy,tar_loc,tar_dis):
-        s_ = np.zeros(self.uav_num * 2 +2 +1) # 下一状态
+        State_dim = self.uav_num*2+2+1
+        s_ = np.zeros(State_dim) 
         for i,uav in enumerate(self.UAVs):
             s_[i*2] = uav.x
             s_[i*2+1] = uav.y     
         s_[2] = tar_loc[0]
         s_[3] = tar_loc[1]
-        s_[4] = tar_dis
+        # s_[4] = tar_dis
+        s_[4] = self.data_size
+        # s_[5] = self.T-self.t #剩余可用时间步
         return s_
 
     # 奖励表达式 平滑处理
@@ -165,7 +170,9 @@ class World(object):
          # 前进奖励（只奖励正向前进）
         progress_reward = max(0, dis_forward * 100)
         # 停留惩罚
-        stay_penalty = -5 if abs(dis_forward) < 0.05 else 0
+        stay_penalty = -10 if abs(dis_forward) < 0.05 else 0
+        if self.transmit:
+            stay_penalty *=2 
         
         comm_penalty = 0  
         
@@ -198,6 +205,7 @@ class World(object):
         fa = 0.0
         reward = 0.0
         fly_energy = 0.0
+        done = False
         self.t = t+1 # 时间步+1
         state_ = np.zeros(self.uav_num*2 +2+1)
         uav_location_pre = np.zeros([self.uav_num, 2])  # make a copy of the uav's location
@@ -227,16 +235,26 @@ class World(object):
         reduce_dis = step_pre - step_cur #推进距离
         
         MaxSINR_A2G = self.get_date_rate_A2G(uav_location)  # 空对地的最大dB
+        
         MaxSINR_G2A = self.get_date_rate_G2A(uav_location)  # 地对空的最大dB
-         
+        self.data_rate = self.BandWidth * np.log2(1 + 10**(MaxSINR_A2G/10.0))
+        
         #在空对地Radio Map中进行传输 
-        if(MaxSINR_A2G >= self.SIR_THRESHOLD_COMM ):
-            self.data_rate = self.BandWidth * np.log2(1 + 10**(MaxSINR_A2G/10.0))  # 数据传输速率
-            if not self.transmit:
-                self.data_size -= self.data_rate*self.delta_T    
-                if(self.data_size < 20):
-                    self.transmit = True
-                    self.data_size = 0
+        if not self.transmit:
+            # print(self.data_rate)
+            self.data_size -= self.data_rate
+            if self.data_size <=0:
+                self.data_size = 0
+                self.transmit = True
+                
+        # if(MaxSINR_A2G >= self.SIR_THRESHOLD_COMM ):
+        #     self.data_rate = self.BandWidth * np.log2(1 + 10**(MaxSINR_A2G/10.0))  # 数据传输速率
+        #     print(self.data_rate)
+        #     if not self.transmit:
+        #         self.data_size -= self.data_rate*self.delta_T    
+        #         if(self.data_size < 20):
+        #             self.transmit = True
+        #             self.data_size = 0
    
         reward += self.get_reward(fa,fly_energy,step_cur,step_cur_pre,reduce_dis,MaxSINR_A2G,MaxSINR_G2A) 
                 
@@ -247,7 +265,7 @@ class World(object):
                 reward += 1000      
             else:
                 print("arrive but not transmit complete, data size:",self.data_size)
-                reward -= self.data_size*2   
+                reward -= self.data_size*3   
                      
                 
             self.target_pre_loc = self.target_loc #更新上一个目标点的位置        
@@ -256,11 +274,11 @@ class World(object):
             
             if self.Traverse_order == len(self.Traverse): #到达终点了
                 self.terminal = True
-                self.done = True    
+                done = True    
                 print("=================================complete task!!========================")      
             else :                              
                 self.terminal = False
-                self.done = False               
+                done = False               
                 if self.Traverse_order < len(self.Traverse) - 1:  # 如果还有下一个目标点
                     print("=================================arrive point:",self.Traverse[self.Traverse_order])
                     self.Traverse_order += 1 #更新目标点
@@ -277,7 +295,8 @@ class World(object):
         if self.terminal or self.t >= self.T: # 如果任务完成，或者飞行时间步已经满了
             done = True
             if self.terminal:
-                reward += 2000
+                print("完成任务所用时间为：",self.t*self.delta_T)
+                reward += 2000+(self.T-self.t)
             if self.t >= self.T:
                 reward -= 1000
             
