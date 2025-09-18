@@ -40,21 +40,25 @@ class World(object):
         self.terminal = False
         self.total_engy = 0.0
         self.out_time = 0.0
-        self.NON_COMM_PENALTY = -5 # 不满足通信阈值的惩罚
-        self.NON_COVER_PENALTY = -10 # 不满足覆盖阈值的惩罚
+        self.NON_COMM_PENALTY = -0.5 # 不满足通信阈值的惩罚
+        self.NON_COVER_PENALTY = -3 # 不满足覆盖阈值的惩罚
         
         self.Engy_w = 0.05
 
         self.initial_loc = ini_loc # 起点
         self.end_loc = end_loc # 终点
+        self.fly_dis = 0.0 #累计飞行距离
         self.distance = 0.5 # m
         self.SIR_THRESHOLD_COMM = 3 # dB 通信阈值
-        self.SIR_THRESHOLD_COVER = 2 # dB 通信阈值
+        self.SIR_THRESHOLD_COVER = 0 # dB 覆盖
         self.data_size_ini = data_size # 每个巡检点的数据量
         self.data_size = self.data_size_ini  # 每个巡检点的数据量
         self.data_rate = 0
         self.BandWidth = 1
         self.transmit = False # 是否完成数据传输
+        self.trans_delay_start = 0
+        self.trans_delay_end = self.T
+        self.trans_delay = 0
         
         self.Traverse = traverse_sequence # 巡检点序列
         self.Traverse_order = 0 # 巡检点序列索引
@@ -104,12 +108,16 @@ class World(object):
     def reset(self):
         self.reset_target()
         self.set_uavs_loc()
+        self.trans_delay_start = 0
+        self.trans_delay_end = self.T
+        self.trans_delay = 0
         self.data_size = 0
         self.transmit = True  
         self.t = 0
         self.fa = 0
         self.out_time = 0
         self.total_engy = 0.0
+        self.fly_dis = 0.0
         state = self.reset_state()
         return state,self.t
 
@@ -168,11 +176,11 @@ class World(object):
             SINR: 信噪比
         """
          # 前进奖励（只奖励正向前进）
-        progress_reward = max(0, dis_forward * 100)
+        progress_reward = dis_forward*10 # (-2.5,2.5)
         # 停留惩罚
-        stay_penalty = -10 if abs(dis_forward) < 0.05 else 0
-        if self.transmit:
-            stay_penalty *=2 
+        # stay_penalty = -10 if abs(dis_forward) < 0.05 else 0
+        # if self.transmit:
+        #     stay_penalty *=2 
         
         comm_penalty = 0  
         
@@ -182,7 +190,7 @@ class World(object):
         if SINR_G2A < self.SIR_THRESHOLD_COVER:
             comm_penalty += self.NON_COVER_PENALTY
         
-        total_reward = progress_reward - fa + stay_penalty + comm_penalty   
+        total_reward = progress_reward - min(10,fa)  + comm_penalty   
                          
         return total_reward
 
@@ -205,6 +213,7 @@ class World(object):
         fa = 0.0
         reward = 0.0
         fly_energy = 0.0
+        
         done = False
         self.t = t+1 # 时间步+1
         state_ = np.zeros(self.uav_num*2 +2+1)
@@ -216,6 +225,7 @@ class World(object):
         if len(actions) == self.uav_num * 2:
             for i, uav in enumerate(self.UAVs):
                 uav.move_inside(actions[0],actions[1],self.dist_max)  # execute the action执行飞行动作
+                self.fly_dis += actions[1]
             for i, uav in enumerate(self.UAVs):
                 penalty, bound = self.boundary_margin(uav) # 输出出界奖励,出界bound 为 false
                 fa += penalty # 累计出界奖励Pob
@@ -246,6 +256,9 @@ class World(object):
             if self.data_size <=0:
                 self.data_size = 0
                 self.transmit = True
+                self.trans_delay_end = self.t
+                # print("点",self.target_pre_loc,"->","点",self.target_loc,"该段时延为:",(self.trans_delay_end-self.trans_delay_start)*self.delta_T)
+                self.trans_delay += self.trans_delay_end-self.trans_delay_start
                 
         # if(MaxSINR_A2G >= self.SIR_THRESHOLD_COMM ):
         #     self.data_rate = self.BandWidth * np.log2(1 + 10**(MaxSINR_A2G/10.0))  # 数据传输速率
@@ -262,15 +275,16 @@ class World(object):
             #只要到目标点了，就换下一个目标点，根据传输完成情况进行奖惩
             if self.transmit:  
                 print("arrive and transmit complete")
-                reward += 1000      
+                reward += 200-(self.trans_delay_end-self.trans_delay_start)*self.delta_T-(self.t-self.trans_delay_start)*self.delta_T      
             else:
                 print("arrive but not transmit complete, data size:",self.data_size)
-                reward -= self.data_size*3   
+                reward -= self.data_size+(self.trans_delay_end-self.trans_delay_start)*self.delta_T+(self.t-self.trans_delay_start)*self.delta_T     
                      
                 
             self.target_pre_loc = self.target_loc #更新上一个目标点的位置        
             self.transmit = False
             self.data_size = self.data_size_ini # 重置数据量  
+            self.trans_delay_start = self.t
             
             if self.Traverse_order == len(self.Traverse): #到达终点了
                 self.terminal = True
@@ -295,10 +309,10 @@ class World(object):
         if self.terminal or self.t >= self.T: # 如果任务完成，或者飞行时间步已经满了
             done = True
             if self.terminal:
-                print("完成任务所用时间为：",self.t*self.delta_T)
-                reward += 2000+(self.T-self.t)
+                print("完成任务所用时间为：",self.t*self.delta_T,"传输总时延:",self.trans_delay*self.delta_T,"总飞行距离:",self.fly_dis*100)
+                reward += 1000-self.t*self.delta_T-self.trans_delay*self.delta_T-self.fly_dis
             if self.t >= self.T:
-                reward -= 1000
+                reward -= self.t*self.delta_T+self.trans_delay*self.delta_T+self.fly_dis
             
         state_ = self.update_state(fly_energy,self.target_loc,self.target_dis)  # 进入下一状态
         self.r = reward
@@ -307,23 +321,18 @@ class World(object):
 
     #计算出界惩罚fa=1
     def boundary_margin(self, uav):
-        """检查无人机是否出界并计算惩罚"""
-        margin = 1.0  # 边界容忍度
-        penalty_factor = 100 / self.uav_num
-        
-        # 计算到边界中心的距离
-        center_x = (self.max_x + self.min_x) / 2
-        center_y = (self.max_y + self.min_y) / 2
-        
-        # 计算超出边界的距离
-        x_exceed = max(abs(uav.x - center_x) - margin * (self.max_x - self.min_x) / 2, 0.0)
-        y_exceed = max(abs(uav.y - center_y) - margin * (self.max_y - self.min_y) / 2, 0.0)
-        
-        if x_exceed == 0.0 and y_exceed == 0.0:
-            return 0.0, True  # 无惩罚，在边界内
+        bound = True
+        v1 = 1.0
+        alpha = 0.0
+        beta = 100 / self.uav_num   #  Pob = 1/k惩罚项
+        lx_plus = max(abs(uav.x - (self.max_x + self.min_x) / 2) - v1 * (self.max_x - self.min_x) / 2, 0.0)
+        ly_plus = max(abs(uav.y - (self.max_y + self.min_y) / 2) - v1 * (self.max_y - self.min_y) / 2, 0.0)
+        if lx_plus == 0.0 and ly_plus == 0.0:
+            fa = 0.0
         else:
-            penalty = penalty_factor * (x_exceed**2 + y_exceed**2)
-            return penalty, False  # 有惩罚，出界
+            fa = (alpha * (lx_plus ** 2 + ly_plus ** 2 ) + beta) * 1 # 出界惩罚
+            bound = False # 出界标志
+        return fa, bound
 
     # 推进能量
     # def power(self,v):
