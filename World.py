@@ -184,6 +184,7 @@ class World(object):
         
         comm_penalty = 0  
         
+        
         if SINR_A2G < self.SIR_THRESHOLD_COMM and not self.transmit:
             comm_penalty += self.NON_COMM_PENALTY    
         
