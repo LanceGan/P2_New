@@ -311,6 +311,7 @@ class World(object):
             
         state_ = self.update_state(fly_energy,self.target_loc,self.target_dis)  # 进入下一状态
         self.r = reward
+        
  
         return state_, self.r,done,self.t,self.terminal
 
